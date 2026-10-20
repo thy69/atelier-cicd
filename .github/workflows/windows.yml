@@ -1,0 +1,151 @@
+# Variante Windows : le même pipeline, sans Docker, sur un agent Windows.
+#
+# Cas d'usage : client lourd, déploiement on-premise, outils Windows.
+# Différences avec pipeline.yml :
+#   - agent windows-2025 (version épinglée) au lieu d'ubuntu-latest ;
+#   - la toolchain (Python) est installée par la CI, à la version fixée
+#     dans le dépôt (.python-version), au lieu d'être dans une image Docker ;
+#   - le livrable est un paquet zip au lieu d'une image ;
+#   - scripts PowerShell (ci/windows/*.ps1) au lieu de bash.
+# Les étapes et les principes sont identiques.
+name: pipeline-windows
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  APP_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '0.0.0-dev' }}
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  windows-test:
+    runs-on: windows-2025
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v7
+
+      - name: Installer Python (version fixée dans .python-version)
+        uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+
+      - name: Lint et tests unitaires
+        run: ./ci/windows/test.ps1
+
+      - name: Conserver le rapport de tests
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tests-windows
+          path: out/tests.xml
+          retention-days: 30
+
+  windows-paquet:
+    needs: windows-test
+    runs-on: windows-2025
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v7
+
+      - name: Installer Python (version fixée dans .python-version)
+        uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+
+      - name: Construire le paquet
+        run: ./ci/windows/package.ps1
+
+      - name: Smoke test du paquet
+        run: ./ci/windows/smoke-test.ps1
+
+      - name: Conserver le paquet comme artefact
+        uses: actions/upload-artifact@v7
+        with:
+          name: paquet-windows
+          path: out/atelier-cicd-*-win-x64.zip
+          retention-days: 7
+
+  windows-securite:
+    needs: windows-paquet
+    runs-on: windows-2025
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v7
+
+      # On analyse le paquet produit par le job précédent, pas un nouveau.
+      - name: Récupérer le paquet
+        uses: actions/download-artifact@v8
+        with:
+          name: paquet-windows
+          path: out
+
+      - name: Générer la SBOM du paquet
+        run: ./ci/windows/sbom.ps1
+
+      - name: Conserver la SBOM
+        uses: actions/upload-artifact@v7
+        with:
+          name: sbom-windows
+          path: |
+            out/sbom.cdx.json
+            out/sbom.spdx.json
+            out/sbom.txt
+          retention-days: 30
+
+      - name: Scanner les vulnérabilités
+        run: ./ci/windows/scan.ps1
+
+      - name: Conserver le rapport de vulnérabilités
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: vulnerabilites-windows
+          path: out/vulnerabilites.txt
+          retention-days: 30
+
+  # Sur un tag v* : le paquet et sa SBOM sont joints à la release.
+  # (Dans un vrai projet : signature Authenticode du MSI avant cette étape,
+  # puis publication sur le portail de téléchargement des clients.)
+  windows-release:
+    needs: windows-securite
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Récupérer le paquet
+        uses: actions/download-artifact@v8
+        with:
+          name: paquet-windows
+          path: out
+
+      - name: Récupérer la SBOM
+        uses: actions/download-artifact@v8
+        with:
+          name: sbom-windows
+          path: out/sbom
+
+      # Le pipeline Linux peut créer la même release en parallèle :
+      # on crée la release si elle n'existe pas, sinon on la complète.
+      - name: Joindre le paquet à la release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mv out/sbom/sbom.cdx.json "out/sbom-windows.cdx.json"
+          files=(out/atelier-cicd-*-win-x64.zip out/sbom-windows.cdx.json)
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" \
+              --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes \
+            || gh release upload "$GITHUB_REF_NAME" "${files[@]}" \
+              --repo "$GITHUB_REPOSITORY" --clobber
