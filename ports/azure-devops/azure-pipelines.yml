@@ -1,0 +1,150 @@
+# Portage Azure DevOps (Azure Pipelines) du pipeline de l'atelier
+# (équivalent de l'étape 7).
+#
+# Prérequis côté projet Azure DevOps :
+#   - un registre : Azure Container Registry, ou tout registre Docker ;
+#   - un groupe de variables "registre" contenant REGISTRY, REGISTRY_USER
+#     et REGISTRY_PASSWORD (ce dernier marqué secret) ;
+#   - deux environnements "staging" et "production" (Pipelines > Environments).
+#     L'approbation de la production se règle sur l'environnement
+#     (Approvals and checks), pas dans ce fichier.
+#
+# Correspondances principales avec GitHub Actions :
+#   jobs + needs            -> stages + dependsOn
+#   upload/download-artifact -> publish / download (Pipeline Artifacts)
+#   job "environment"       -> job de type "deployment"
+#   outputs de job          -> variables de sortie (isOutput=true)
+
+trigger:
+  branches:
+    include: [main]
+  tags:
+    include: ["v*"]
+
+pr:
+  branches:
+    include: [main]
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: registre
+  - name: IMAGE_NAME
+    value: $(REGISTRY)/atelier-cicd
+  - name: SOURCE_URL
+    value: $(Build.Repository.Uri)
+  - name: isTag
+    value: ${{ startsWith(variables['Build.SourceBranch'], 'refs/tags/v') }}
+  - name: isMain
+    value: ${{ eq(variables['Build.SourceBranch'], 'refs/heads/main') }}
+  - ${{ if startsWith(variables['Build.SourceBranch'], 'refs/tags/v') }}:
+      - name: APP_VERSION
+        value: $(Build.SourceBranchName)
+      - name: IMAGE_TAG
+        value: $(Build.SourceBranchName)
+
+stages:
+  - stage: test
+    jobs:
+      - job: test
+        steps:
+          - script: bash ci/lint-test.sh
+            displayName: Lint et tests unitaires
+
+  - stage: build
+    dependsOn: test
+    jobs:
+      - job: build
+        steps:
+          - script: bash ci/build.sh
+            displayName: Construire l'image
+          - script: bash ci/smoke-test.sh
+            displayName: Smoke test
+          - publish: out/image.tar
+            artifact: image
+            displayName: Conserver l'image comme artefact
+
+  - stage: securite
+    dependsOn: build
+    jobs:
+      - job: securite
+        steps:
+          - download: current
+            artifact: image
+          - script: |
+              mkdir -p out
+              cp "$(Pipeline.Workspace)/image/image.tar" out/
+            displayName: Placer l'image dans out/
+          - script: bash ci/sbom.sh
+            displayName: Générer la SBOM
+          - script: bash ci/scan.sh
+            displayName: Scanner les vulnérabilités
+          - script: |
+              mkdir -p rapports
+              cp out/sbom.* out/vulnerabilites.txt rapports/ 2>/dev/null || true
+            condition: always()
+            displayName: Rassembler SBOM et rapport
+          - publish: rapports
+            artifact: sbom
+            condition: always()
+            displayName: Conserver SBOM et rapport
+
+  - stage: publish
+    dependsOn: securite
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: publish
+        steps:
+          - download: current
+            artifact: image
+          - script: |
+              mkdir -p out
+              cp "$(Pipeline.Workspace)/image/image.tar" out/
+              if [ "$(isTag)" = "True" ]; then extra=latest; else extra=main; fi
+              bash ci/publish.sh "$extra"
+              echo "##vso[task.setvariable variable=image;isOutput=true]$(cat out/image-digest.txt)"
+            name: push
+            displayName: Publier l'image
+            env:
+              REGISTRY_PASSWORD: $(REGISTRY_PASSWORD)   # les secrets doivent être passés explicitement
+
+  - stage: deploy_staging
+    dependsOn: publish
+    condition: and(succeeded(), eq(variables['isMain'], 'True'))
+    variables:
+      IMAGE_REF: $[ stageDependencies.publish.publish.outputs['push.image'] ]
+    jobs:
+      - deployment: staging
+        environment: staging
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - script: bash ci/deploy.sh staging "$(IMAGE_REF)"
+                  displayName: Déployer sur staging
+                  env:
+                    REGISTRY_PASSWORD: $(REGISTRY_PASSWORD)
+
+  - stage: deploy_production
+    dependsOn: [publish, deploy_staging]
+    condition: succeeded()
+    variables:
+      IMAGE_REF: $[ stageDependencies.publish.publish.outputs['push.image'] ]
+    jobs:
+      - deployment: production
+        environment: production   # approbation configurée sur l'environnement
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - script: bash ci/deploy.sh production "$(IMAGE_REF)"
+                  displayName: Déployer en production
+                  env:
+                    REGISTRY_PASSWORD: $(REGISTRY_PASSWORD)
+
+# Pas de "release" ici : Azure DevOps n'a pas d'objet release équivalent
+# aux releases GitHub. La SBOM reste attachée au run (artefact "sbom") ;
+# on peut aussi la publier dans Azure Artifacts (Universal Packages).

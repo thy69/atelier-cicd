@@ -1,0 +1,140 @@
+# Portage GitLab CI du pipeline de l'atelier (équivalent de l'étape 7).
+# Utilisation : copier ce fichier à la racine du dépôt GitLab.
+#
+# Correspondances principales avec GitHub Actions :
+#   job "needs"            -> needs
+#   upload/download-artifact -> artifacts + needs (téléchargement automatique)
+#   environment + approbation -> environment + "Protected environments"
+#                               ou when: manual (cf. deploy-production)
+#   secrets.GITHUB_TOKEN   -> CI_REGISTRY_USER / CI_REGISTRY_PASSWORD (fournis)
+
+stages: [test, build, securite, publish, deploy, release]
+
+# Tous les jobs utilisent Docker-in-Docker : le job tourne dans un conteneur
+# "docker:cli" qui parle à un démon Docker dédié (service "docker:dind").
+default:
+  image: docker:29-cli
+  services:
+    - docker:29-dind
+  before_script:
+    - apk add --no-cache bash git
+
+variables:
+  DOCKER_TLS_CERTDIR: "/certs"
+  IMAGE_NAME: $CI_REGISTRY_IMAGE
+  SOURCE_URL: $CI_PROJECT_URL
+  GIT_SHA: $CI_COMMIT_SHORT_SHA
+
+# Déclencheurs (équivalent du bloc "on:" de GitHub)
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_TAG =~ /^v/
+      variables:
+        APP_VERSION: $CI_COMMIT_TAG
+        IMAGE_TAG: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+test:
+  stage: test
+  script:
+    - bash ci/lint-test.sh
+
+build:
+  stage: build
+  needs: [test]
+  script:
+    - bash ci/build.sh
+    - bash ci/smoke-test.sh
+  artifacts:
+    paths: [out/image.tar]
+    expire_in: 3 days
+
+securite:
+  stage: securite
+  needs: [build]
+  script:
+    - bash ci/sbom.sh
+    - bash ci/scan.sh
+  artifacts:
+    when: always
+    paths:
+      - out/sbom.cdx.json
+      - out/sbom.spdx.json
+      - out/sbom.txt
+      - out/vulnerabilites.txt
+    expire_in: 30 days
+
+publish:
+  stage: publish
+  needs: [build, securite]
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+      variables: { EXTRA_TAG: latest }
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      variables: { EXTRA_TAG: main }
+  variables:
+    REGISTRY: $CI_REGISTRY
+    REGISTRY_USER: $CI_REGISTRY_USER
+    REGISTRY_PASSWORD: $CI_REGISTRY_PASSWORD
+  script:
+    - bash ci/publish.sh "$EXTRA_TAG"
+    - echo "IMAGE_REF=$(cat out/image-digest.txt)" > publish.env
+  artifacts:
+    reports:
+      dotenv: publish.env   # expose IMAGE_REF aux jobs suivants
+
+.deploy:
+  stage: deploy
+  variables:
+    REGISTRY: $CI_REGISTRY
+    REGISTRY_USER: $CI_REGISTRY_USER
+    REGISTRY_PASSWORD: $CI_REGISTRY_PASSWORD
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+deploy-staging:
+  extends: .deploy
+  needs: [publish]
+  environment:
+    name: staging
+  resource_group: staging
+  script:
+    - bash ci/deploy.sh staging "$IMAGE_REF"
+
+# Approbation : "when: manual" fonctionne sur toutes les offres GitLab.
+# Sur les offres payantes, préférer un "Protected environment" avec
+# approbateurs obligatoires (Settings > CI/CD > Protected environments).
+deploy-production:
+  extends: .deploy
+  needs: [publish, deploy-staging]
+  environment:
+    name: production
+  resource_group: production
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+  script:
+    - bash ci/deploy.sh production "$IMAGE_REF"
+
+# Le mot-clé "release" exige une image contenant l'outil de release GitLab.
+# Selon la version de GitLab : release-cli (historique) ou glab (récent).
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  services: []
+  before_script: []
+  needs: [securite, publish]
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+  script:
+    - echo "Release $CI_COMMIT_TAG, image $IMAGE_REF"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: $CI_COMMIT_TAG
+    description: "Image : $IMAGE_REF"
+    assets:
+      links:
+        - name: SBOM CycloneDX
+          url: "$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/out/sbom.cdx.json?job=securite"

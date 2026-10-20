@@ -1,0 +1,123 @@
+// Portage Jenkins (pipeline déclaratif) du pipeline de l'atelier
+// (équivalent de l'étape 7).
+//
+// Prérequis côté Jenkins :
+//   - un agent Linux avec Docker et bash (label "docker") ;
+//   - un job de type "Multibranch Pipeline" pointant sur le dépôt
+//     (gère branches, PR et tags) ;
+//   - un identifiant "registre" de type "Username with password" ;
+//   - la variable REGISTRY ci-dessous adaptée (Nexus, Harbor, ACR, GHCR...).
+//
+// Correspondances principales avec GitHub Actions :
+//   jobs + needs            -> stages (séquentiels)
+//   upload-artifact         -> archiveArtifacts / stash + unstash
+//   environment + approbation -> stage avec "input"
+//   secrets                 -> withCredentials / credentials()
+
+pipeline {
+    agent { label 'docker' }
+
+    options {
+        timeout(time: 1, unit: 'HOURS')
+        buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '5'))
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        REGISTRY   = 'registry.example.com'
+        IMAGE_NAME = "${REGISTRY}/atelier-cicd"
+        SOURCE_URL = "${env.GIT_URL ?: ''}"
+    }
+
+    stages {
+        stage('Version') {
+            steps {
+                script {
+                    if (env.TAG_NAME?.startsWith('v')) {
+                        env.APP_VERSION = env.TAG_NAME
+                        env.IMAGE_TAG = env.TAG_NAME
+                    }
+                }
+            }
+        }
+
+        stage('test') {
+            steps {
+                sh 'bash ci/lint-test.sh'
+            }
+        }
+
+        stage('build') {
+            steps {
+                sh 'bash ci/build.sh'
+                sh 'bash ci/smoke-test.sh'
+            }
+        }
+
+        stage('securite') {
+            steps {
+                sh 'bash ci/sbom.sh'
+                sh 'bash ci/scan.sh'
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'out/sbom.*, out/vulnerabilites.txt', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('publish') {
+            when {
+                anyOf { branch 'main'; buildingTag() }
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'registre',
+                                                  usernameVariable: 'REGISTRY_USER',
+                                                  passwordVariable: 'REGISTRY_PASSWORD')]) {
+                    sh '''
+                        if [ -n "${TAG_NAME:-}" ]; then extra=latest; else extra=main; fi
+                        bash ci/publish.sh "$extra"
+                    '''
+                }
+                script {
+                    env.IMAGE_REF = readFile('out/image-digest.txt').trim()
+                }
+            }
+        }
+
+        stage('deploy-staging') {
+            when { branch 'main' }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'registre',
+                                                  usernameVariable: 'REGISTRY_USER',
+                                                  passwordVariable: 'REGISTRY_PASSWORD')]) {
+                    sh 'bash ci/deploy.sh staging "$IMAGE_REF"'
+                }
+            }
+        }
+
+        // Approbation manuelle. Remarque : ici l'attente occupe l'agent. Sur une
+        // vraie usine, déclarer "agent none" en tête de pipeline et un agent
+        // par stage, pour que l'attente ne bloque aucun exécuteur.
+        stage('deploy-production') {
+            when { branch 'main' }
+            input {
+                message 'Déployer en production ?'
+                ok 'Déployer'
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'registre',
+                                                  usernameVariable: 'REGISTRY_USER',
+                                                  passwordVariable: 'REGISTRY_PASSWORD')]) {
+                    sh 'bash ci/deploy.sh production "$IMAGE_REF"'
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'out/deploiement-*.txt', allowEmptyArchive: true
+        }
+    }
+}
