@@ -1,9 +1,10 @@
-# Étape 3 : SBOM et scan de vulnérabilités (quality gate de sécurité).
+# Étape 4 : publication dans un registre d'images (GitHub Container Registry).
 name: pipeline
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]            # un tag git v1.2.0 produit l'image :v1.2.0
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -13,6 +14,11 @@ permissions:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
+  SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+  # Sur un tag git : version = nom du tag. Sinon : version de développement
+  # et tag d'image calculé à partir du commit (sha-xxxxxxxx, cf. ci/common.sh).
+  APP_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '0.0.0-dev' }}
+  IMAGE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
 
 jobs:
   test:
@@ -51,7 +57,6 @@ jobs:
       - name: Récupérer le code
         uses: actions/checkout@v7
 
-      # On analyse l'image construite par le job "build", pas une nouvelle.
       - name: Récupérer l'image (artefact du job build)
         uses: actions/download-artifact@v8
         with:
@@ -75,9 +80,43 @@ jobs:
         run: bash ci/scan.sh
 
       - name: Conserver le rapport de vulnérabilités
-        if: always()          # même (surtout) si le scan a échoué
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: vulnerabilites
           path: out/vulnerabilites.txt
           retention-days: 30
+
+  publish:
+    needs: securite
+    if: github.event_name == 'push'   # jamais depuis une PR
+    runs-on: ubuntu-latest
+    # Seul ce job a le droit d'écrire dans le registre.
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v7
+
+      - name: Récupérer l'image (artefact du job build)
+        uses: actions/download-artifact@v8
+        with:
+          name: image
+          path: out
+
+      - name: Publier dans GitHub Container Registry
+        id: push
+        env:
+          REGISTRY: ghcr.io
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            bash ci/publish.sh latest
+          else
+            bash ci/publish.sh main
+          fi
+          echo "image=$(cat out/image-digest.txt)" >> "$GITHUB_OUTPUT"
