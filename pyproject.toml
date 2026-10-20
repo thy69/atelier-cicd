@@ -1,0 +1,14 @@
+[project]
+name = "atelier-cicd"
+description = "Mini API support de l'atelier CI/CD"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]

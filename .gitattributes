@@ -1,0 +1,9 @@
+# Les scripts shell doivent garder des fins de ligne Unix, y compris quand
+# le dépôt est cloné sous Windows (sinon : "bad interpreter" sur le runner).
+*.sh   text eol=lf
+*.env  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf
+Jenkinsfile text eol=lf
+*.ps1  text eol=lf
