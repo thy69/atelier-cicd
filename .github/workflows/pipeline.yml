@@ -1,17 +1,19 @@
-# Étape 1 : premier pipeline d'intégration continue.
+# Étape 2 : construction de l'image et gestion d'artefact.
 name: pipeline
 
-# Déclencheurs : quand le pipeline tourne-t-il ?
 on:
   push:
-    branches: [main]        # chaque commit sur main
+    branches: [main]
   pull_request:
-    branches: [main]        # chaque PR qui vise main
-  workflow_dispatch:        # bouton "Run workflow" (lancement manuel)
+    branches: [main]
+  workflow_dispatch:
 
-# Moindre privilège : le jeton du pipeline ne peut que lire le code.
 permissions:
   contents: read
+
+# Variables disponibles dans tous les jobs (lues par ci/common.sh).
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
 
 jobs:
   test:
@@ -22,3 +24,23 @@ jobs:
 
       - name: Lint et tests unitaires
         run: bash ci/lint-test.sh
+
+  build:
+    needs: test               # ne démarre que si "test" est vert
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v7
+
+      - name: Construire l'image
+        run: bash ci/build.sh
+
+      - name: Smoke test
+        run: bash ci/smoke-test.sh
+
+      - name: Conserver l'image comme artefact
+        uses: actions/upload-artifact@v7
+        with:
+          name: image
+          path: out/image.tar
+          retention-days: 3   # rétention courte : l'image sera dans le registre
