@@ -1,0 +1,24 @@
+# Étape 1 : premier pipeline d'intégration continue.
+name: pipeline
+
+# Déclencheurs : quand le pipeline tourne-t-il ?
+on:
+  push:
+    branches: [main]        # chaque commit sur main
+  pull_request:
+    branches: [main]        # chaque PR qui vise main
+  workflow_dispatch:        # bouton "Run workflow" (lancement manuel)
+
+# Moindre privilège : le jeton du pipeline ne peut que lire le code.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v7
+
+      - name: Lint et tests unitaires
+        run: bash ci/lint-test.sh
