@@ -1,4 +1,4 @@
-# Étape 4 : publication dans un registre d'images (GitHub Container Registry).
+# Étape 6 : déploiement continu sur deux environnements (staging, production).
 name: pipeline
 
 on:
@@ -120,3 +120,60 @@ jobs:
             bash ci/publish.sh main
           fi
           echo "image=$(cat out/image-digest.txt)" >> "$GITHUB_OUTPUT"
+
+  # Staging : déploiement automatique à chaque commit sur main.
+  deploy-staging:
+    needs: publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+    concurrency:
+      group: deploy-staging   # jamais deux déploiements staging en parallèle
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v7
+
+      # L'image est passée par variable d'environnement, jamais interpolée
+      # directement dans le script (protection contre l'injection).
+      - name: Déployer sur staging
+        env:
+          REGISTRY: ghcr.io
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REF: ${{ needs.publish.outputs.image }}
+        run: |
+          bash ci/deploy.sh staging "$IMAGE_REF"
+          echo "Déployé sur **staging** : \`$IMAGE_REF\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # Production : MÊME image (même digest) que staging, après approbation
+  # manuelle. La règle d'approbation est portée par l'environnement
+  # "production" (Settings > Environments), pas par ce fichier.
+  deploy-production:
+    needs: [publish, deploy-staging]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v7
+
+      - name: Déployer en production
+        env:
+          REGISTRY: ghcr.io
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REF: ${{ needs.publish.outputs.image }}
+        run: |
+          bash ci/deploy.sh production "$IMAGE_REF"
+          echo "Déployé en **production** : \`$IMAGE_REF\`" >> "$GITHUB_STEP_SUMMARY"
