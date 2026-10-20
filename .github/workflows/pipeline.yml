@@ -1,4 +1,4 @@
-# Étape 6 : déploiement continu sur deux environnements (staging, production).
+# Étape 7 : release versionnée sur tag git, avec la SBOM jointe.
 name: pipeline
 
 on:
@@ -177,3 +177,37 @@ jobs:
         run: |
           bash ci/deploy.sh production "$IMAGE_REF"
           echo "Déployé en **production** : \`$IMAGE_REF\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # Release : sur un tag git v*, publie une release GitHub avec la SBOM.
+  release:
+    needs: [securite, publish]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write         # nécessaire pour créer la release
+    steps:
+      - name: Récupérer la SBOM (artefact du job securite)
+        uses: actions/download-artifact@v8
+        with:
+          name: sbom
+          path: out
+
+      # Si la release a été créée depuis l'interface (ce qui crée aussi le
+      # tag), on y joint simplement la SBOM. Sinon on la crée.
+      - name: Créer la release (ou la compléter)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REF: ${{ needs.publish.outputs.image }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              out/sbom.cdx.json out/sbom.spdx.json \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              out/sbom.cdx.json out/sbom.spdx.json \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --notes "Image : \`$IMAGE_REF\`" \
+              --generate-notes
+          fi
